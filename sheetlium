@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+#
+# Sheetlium — the networking layer for Sheeternetes (our Cilium). A shared Docker
+# network gives pods L3 connectivity, and each Deployment name is registered as a
+# network-alias == a round-robin DNS Service. This CLI creates/inspects that layer.
+#
+#   sheetlium up                 # create the shared network
+#   sheetlium status             # show the network + services (aliases) + endpoints
+#   sheetlium services           # list Services (deployment aliases)
+#   sheetlium endpoints <svc>    # show backing container IPs for a Service
+#   sheetlium down               # remove the shared network (pods must be gone)
+#
+# Requires: docker. Set SK_NET to match your kubelet (default: sheeternetes).
+set -euo pipefail
+SK_NET="${SK_NET:-sheeternetes}"
+
+need_docker() { command -v docker >/dev/null 2>&1 || { echo "sheetlium: docker not found" >&2; exit 1; }; }
+
+# containers on our network, one JSON line each: {name, ip, aliases[]}
+_endpoints() {
+  docker network inspect "$SK_NET" -f '{{json .Containers}}' 2>/dev/null | \
+    jq -r 'to_entries[] | {name:.value.Name, ip:(.value.IPv4Address|split("/")[0])}'
+}
+
+cmd="${1:-status}"; shift || true
+case "$cmd" in
+  up)
+    need_docker
+    docker network inspect "$SK_NET" >/dev/null 2>&1 && echo "network '$SK_NET' already exists" \
+      || { docker network create "$SK_NET" >/dev/null && echo "created network '$SK_NET'"; }
+    ;;
+  down)
+    need_docker
+    docker network rm "$SK_NET" >/dev/null 2>&1 && echo "removed network '$SK_NET'" \
+      || { echo "sheetlium: could not remove '$SK_NET' (still has endpoints?)" >&2; exit 1; }
+    ;;
+  status)
+    need_docker
+    if ! docker network inspect "$SK_NET" >/dev/null 2>&1; then
+      echo "Sheetlium: network '$SK_NET' does not exist. Run: sheetlium up"; exit 0
+    fi
+    n=$(docker network inspect "$SK_NET" -f '{{len .Containers}}')
+    echo "Sheetlium status"
+    echo "  network:   $SK_NET (OK)"
+    echo "  endpoints: $n container(s)"
+    echo "  services:  $("$0" services 2>/dev/null | wc -l | tr -d ' ')"
+    echo "It reconciles."
+    ;;
+  services)
+    need_docker
+    # a Service == a Deployment name, exposed as a network-alias on member containers
+    docker ps --filter "network=$SK_NET" --filter "label=sheeternetes.pod" \
+      --format '{{.Label "sheeternetes.pod"}}' 2>/dev/null \
+      | sed -E 's/-[0-9]+$//' | sort -u
+    ;;
+  endpoints)
+    need_docker
+    svc="${1:?usage: sheetlium endpoints <service>}"
+    docker ps --filter "network=$SK_NET" --format '{{.Names}}' \
+      | grep -E "^sk_${svc}(-[0-9]+)?$" \
+      | while read -r c; do
+          ip=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$SK_NET\").IPAddress}}" "$c" 2>/dev/null)
+          echo "$svc -> $c ($ip)"
+        done
+    ;;
+  *)
+    echo "sheetlium: unknown command '$cmd'" >&2
+    echo "usage: sheetlium {up|down|status|services|endpoints <svc>}" >&2
+    exit 1
+    ;;
+esac
